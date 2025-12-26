@@ -1,0 +1,143 @@
+name: Deploy APIs to Kong
+
+on:
+  push:
+    branches:
+      - master
+      - developer
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy OpenAPI specs to Kong
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Necessário para comparar com commits anteriores
+
+      - name: Detect changed OpenAPI files
+        id: changed-files
+        run: |
+          # Detecta arquivos .yaml alterados
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Para PRs, compara com a branch base
+            CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT origin/${{ github.base_ref }}...HEAD | grep '\.yaml$' || true)
+          else
+            # Para pushes, compara com o commit anterior
+            if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+              # Primeiro commit da branch - pega todos os arquivos
+              CHANGED_FILES=$(find . -maxdepth 1 -name "*.yaml" -type f | sed 's|^\./||' || true)
+            else
+              CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT ${{ github.event.before }} ${{ github.sha }} | grep '\.yaml$' || true)
+            fi
+          fi
+          
+          # Remove arquivos que não estão na raiz (ex: arquivos em .github/)
+          CHANGED_FILES=$(echo "$CHANGED_FILES" | grep -v '/' || true)
+          
+          echo "Changed OpenAPI files:"
+          echo "$CHANGED_FILES"
+          
+          # Salva a lista de arquivos alterados
+          echo "$CHANGED_FILES" > changed-files.txt
+          
+          # Conta quantos arquivos foram alterados
+          if [ -z "$CHANGED_FILES" ]; then
+            FILE_COUNT=0
+          else
+            FILE_COUNT=$(echo "$CHANGED_FILES" | grep -c '^' || echo "0")
+          fi
+          
+          echo "file-count=${FILE_COUNT}" >> $GITHUB_OUTPUT
+          
+          if [ $FILE_COUNT -eq 0 ]; then
+            echo "No OpenAPI files changed. Skipping deployment."
+          else
+            echo "Found $FILE_COUNT changed OpenAPI file(s)"
+          fi
+
+      - name: Set environment variables
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/master" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "KONG_ADMIN_URL=${{ secrets.KONG_ADMIN_URL_PROD }}" >> $GITHUB_ENV
+            echo "KONG_TAG=prod" >> $GITHUB_ENV
+          elif [ "${{ github.ref }}" == "refs/heads/developer" ]; then
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "KONG_ADMIN_URL=${{ secrets.KONG_ADMIN_URL_DEV }}" >> $GITHUB_ENV
+            echo "KONG_TAG=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Display deployment info
+        run: |
+          echo "Deploying to environment: ${{ env.ENVIRONMENT }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Tag: ${{ env.KONG_TAG }}"
+          echo "Files to process: ${{ steps.changed-files.outputs.file-count }}"
+
+      - name: Install deck
+        if: steps.changed-files.outputs.file-count > 0
+        uses: kong/setup-deck@v1 
+        with:
+          deck-version: '1.55.0'
+
+      - name: Ping Kong Admin API
+        if: steps.changed-files.outputs.file-count > 0
+        run: deck ping --kong-addr ${{ env.KONG_ADMIN_URL }}
+
+      - name: Convert OpenAPI to Kong format
+        if: steps.changed-files.outputs.file-count > 0
+        run: |
+          # Cria diretório para os arquivos convertidos
+          mkdir -p kong-specs
+          
+          # Lê a lista de arquivos alterados e converte apenas eles
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              echo "Converting $file..."
+              deck file openapi2kong \
+                --spec "$file" \
+                --output-file "kong-specs/${file%.yaml}-kong.yaml"
+            fi
+          done < changed-files.txt
+          
+          # Verifica se algum arquivo foi convertido
+          if [ ! "$(ls -A kong-specs)" ]; then
+            echo "No files were converted"
+            exit 0
+          fi
+
+      - name: Validate Kong configurations
+        if: steps.changed-files.outputs.file-count > 0
+        run: |
+          for file in kong-specs/*-kong.yaml; do
+            if [ -f "$file" ]; then
+              echo "Validating $file..."
+              deck validate \
+                --state "$file" \
+                --kong-addr ${{ env.KONG_ADMIN_URL }}
+            fi
+          done
+        continue-on-error: true
+
+      - name: Deploy to Kong (${{ env.ENVIRONMENT }})
+        if: steps.changed-files.outputs.file-count > 0
+        run: |
+          for file in kong-specs/*-kong.yaml; do
+            if [ -f "$file" ]; then
+              echo "Deploying $file to ${{ env.ENVIRONMENT }} environment..."
+              deck sync \
+                --state "$file" \
+                --kong-addr ${{ env.KONG_ADMIN_URL }} \
+                --select-tag "${{ env.KONG_TAG }}"
+            fi
+          done
+
+      - name: No changes detected
+        if: steps.changed-files.outputs.file-count == 0
+        run: |
+          echo "No OpenAPI files were modified in this commit."
+          echo "Skipping Kong deployment."
